@@ -32,16 +32,16 @@ public class PythonTest extends AbstractIdeContextTest {
 
 
   /**
-   * Test that a stale {@code .venv} folder left behind by a previously interrupted installation is removed before {@code uv venv} is invoked, see
-   * <a href="https://github.com/devonfw/IDEasy/issues/2313">#2313</a>.
+   * Test that a stale uv staging folder left behind by a previously interrupted installation (e.g. if the process was killed during
+   * {@code uv python install}) is removed before the next installation, see <a href="https://github.com/devonfw/IDEasy/issues/2313">#2313</a>.
    */
   @Test
-  public void testInstallRemovesStaleVenvFolder(WireMockRuntimeInfo wireMockRuntimeInfo) {
+  public void testInstallRemovesStaleUvStagingFolder(WireMockRuntimeInfo wireMockRuntimeInfo) {
 
     // arrange
     IdeTestContext context = newContext(PROJECT_UV, wireMockRuntimeInfo);
     context.setSystemInfo(SystemInfoMock.MAC_X64);
-    Path staleMarker = context.getSoftwarePath().resolve(Python.VENV_FOLDER).resolve("stale.txt");
+    Path staleMarker = context.getSoftwarePath().resolve(Python.FOLDER_UV_STAGING).resolve("stale.txt");
     context.getFileAccess().writeFileContent("stale", staleMarker, true);
     Python python = context.getCommandletManager().getCommandlet(Python.class);
 
@@ -49,8 +49,8 @@ public class PythonTest extends AbstractIdeContextTest {
     python.install();
 
     // assert
-    assertThat(context.getSoftwarePath().resolve("python").resolve("stale.txt")).doesNotExist();
-    assertThat(context.getSoftwarePath().resolve(".venv")).doesNotExist();
+    assertThat(context.getSoftwarePath().resolve(Python.FOLDER_UV_STAGING)).doesNotExist();
+    assertThat(context.getSoftwarePath().resolve("python").resolve("bin").resolve("python")).exists();
     assertThat(context).logAtSuccess().hasMessageContaining("Successfully installed python");
   }
 
@@ -91,7 +91,7 @@ public class PythonTest extends AbstractIdeContextTest {
     Path userPackage = pythonPath.resolve("lib").resolve("site-packages").resolve("mylib").resolve("__init__.py");
     Files.createDirectories(userPackage.getParent());
     Files.writeString(userPackage, "# installed via pip");
-    // simulate that uv or python has removed our version file from the virtual environment
+    // simulate that the user or some tool has removed our version file from the interpreter installation
     Files.delete(versionFile);
     // the version is still determined from the installation itself (e.g. for "ide get-version python")
     assertThat(python.getInstalledVersion()).isEqualTo(VersionIdentifier.of("3.14.6"));
@@ -108,6 +108,11 @@ public class PythonTest extends AbstractIdeContextTest {
   }
 
 
+  /**
+   * Test that {@link Python#setEnvironment} does not export a project environment (no {@code VIRTUAL_ENV} or {@code UV_PROJECT_ENVIRONMENT}) since python is a
+   * shared interpreter and each project must manage its own virtual environment, see
+   * <a href="https://github.com/devonfw/IDEasy/issues/2701">issue 2701</a>.
+   */
   @Test
   public void testSetEnvironment() {
 
@@ -123,8 +128,9 @@ public class PythonTest extends AbstractIdeContextTest {
     // act
     python.setEnvironment(environmentContext, toolInstallation, false);
 
-    // assert
-    assertThat(variables.get("VIRTUAL_ENV").getValue().replace('\\', '/')).endsWith("/software/python");
-    assertThat(variables.get("UV_PROJECT_ENVIRONMENT").getValue().replace('\\', '/')).endsWith("/software/python");
+    // assert - the shared interpreter is on the PATH only, the environment variables that would bind it to a project must not be set
+    assertThat(variables).doesNotContainKey("VIRTUAL_ENV");
+    assertThat(variables).doesNotContainKey("UV_PROJECT_ENVIRONMENT");
+    assertThat(variables).containsKey("PYTHON_HOME");
   }
 }

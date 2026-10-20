@@ -1,10 +1,12 @@
 package com.devonfw.tools.ide.tool.python;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,6 +30,11 @@ import com.devonfw.tools.ide.version.VersionIdentifier;
 
 /**
  * {@link AbstractToolCommandlet} for <a href="https://www.python.org/">python</a>.
+ * <p>
+ * Python is installed as a standalone, uv-managed interpreter via {@code uv python install}. The interpreter is a shared tool (on the {@code PATH} like any
+ * other IDEasy tool), while each project keeps its own virtual environment (e.g. {@code .venv}) that it creates with {@code uv venv}/{@code uv sync}. Therefore
+ * IDEasy must not export {@code VIRTUAL_ENV} or {@code UV_PROJECT_ENVIRONMENT} — those point all projects at a single shared environment and break uv
+ * (see <a href="https://github.com/devonfw/IDEasy/issues/2701">issue 2701</a>).
  */
 public class Python extends AbstractLocalToolCommandlet {
 
@@ -35,12 +42,14 @@ public class Python extends AbstractLocalToolCommandlet {
 
   private static final VersionIdentifier PYTHON_MIN_VERSION = VersionIdentifier.of("3.8.2");
 
-  /** The folder created by {@code uv venv} inside the software folder before it is renamed to the python installation. */
-  static final String VENV_FOLDER = ".venv";
+  /** The (hidden) folder used to install the interpreter with uv before it is relocated to the python installation. */
+  static final String FOLDER_UV_STAGING = ".uv-staging";
 
-  private static final String FILE_PYVENV_CFG = "pyvenv.cfg";
+  /** The folder a uv-managed interpreter uses for its console scripts on Windows. */
+  private static final String FOLDER_SCRIPTS = "Scripts";
 
-  private static final String PYVENV_CFG_VERSION_INFO = "version_info";
+  /** The interpreter executables on Windows that must be resolvable via the {@code bin} folder. */
+  private static final List<String> WINDOWS_PYTHON_EXES = List.of("python.exe", "pythonw.exe");
 
   /**
    * The constructor.
@@ -64,26 +73,108 @@ public class Python extends AbstractLocalToolCommandlet {
     if (Files.exists(installationPath)) {
       fileAccess.backup(installationPath);
     }
+    // clean up an interpreter folder that a previous, interrupted installation may have left behind
+    if (Files.isDirectory(installationPath)) {
+      fileAccess.delete(installationPath);
+    }
     Path softwarePath = installationPath.getParent();
-    Path venvPath = softwarePath.resolve(VENV_FOLDER);
+    Path stagingPath = softwarePath.resolve(FOLDER_UV_STAGING);
+    deleteNonFatal(stagingPath);
+    try {
+      Files.createDirectories(stagingPath);
+      Uv uv = this.context.getCommandletManager().getCommandlet(Uv.class);
+      uv.installPython(stagingPath, resolvedVersion, request.getProcessContext());
+      fileAccess.move(findUvInterpreterDir(stagingPath), installationPath, StandardCopyOption.REPLACE_EXISTING);
+      createWindowsBinSymlink(fileAccess, installationPath);
+      this.context.writeVersionFile(resolvedVersion, installationPath);
+      deleteNonFatal(stagingPath);
+      LOG.debug("Installed {} in version {} at {}", this.tool, resolvedVersion, installationPath);
+    } catch (IOException e) {
+      throw new CliException("Failed to install python in version " + resolvedVersion + " at " + installationPath, e);
+    }
+  }
 
-    fileAccess.delete(venvPath);
+  /**
+   * Deletes the given folder but only logs a warning instead of failing the installation. This is used for the uv staging folder which is pure temporary
+   * debris: a leftover (e.g. because a previous installation was interrupted) is harmless and the next installation recreates it from scratch, so a failed
+   * deletion (e.g. a locked file on Windows) must not block the installation.
+   *
+   * @param path the folder to delete
+   */
+  private void deleteNonFatal(Path path) {
 
-    Uv uv = this.context.getCommandletManager().getCommandlet(Uv.class);
+    if (!Files.exists(path)) {
+      return;
+    }
+    try {
+      this.context.getFileAccess().delete(path);
+    } catch (RuntimeException e) {
+      LOG.warn("Could not delete uv staging folder {} (this is harmless, the next installation recreates it).", path, e);
+    }
+  }
 
-    uv.installPython(softwarePath, resolvedVersion, request.getProcessContext());
-    renameVenvFolderToPython(fileAccess, softwarePath, installationPath);
-    this.context.writeVersionFile(resolvedVersion, installationPath);
-    createWindowsSymlinkBinFolder(fileAccess, installationPath);
-    LOG.debug("Installed {} in version {} at {}", this.tool, resolvedVersion, installationPath);
+  /**
+   * Determines the interpreter directory that uv created in the given staging folder. On Windows the interpreter lives in a {@code python} sub-folder, on all
+   * other platforms in a {@code bin} sub-folder.
+   *
+   * @param stagingPath the folder uv installed the interpreter into
+   * @return the directory to be relocated into the python installation
+   */
+  private Path findUvInterpreterDir(Path stagingPath) {
+
+    try (Stream<Path> children = Files.list(stagingPath)) {
+      List<Path> candidates = children.filter(child -> !Files.isSymbolicLink(child)).filter(Files::isDirectory)
+          .filter(child -> !child.getFileName().toString().startsWith(".")).filter(this::isUvInterpreterRoot).toList();
+      if (candidates.size() != 1) {
+        throw new CliException("Unexpected interpreter layout in uv staging folder " + stagingPath
+            + ": expected exactly one interpreter directory but found " + candidates.size());
+      }
+      return candidates.get(0);
+    } catch (IOException e) {
+      throw new CliException("Failed to determine the uv-managed interpreter in " + stagingPath, e);
+    }
+  }
+
+  /**
+   * @param path the {@link Path} to check
+   * @return {@code true} if the given {@code Path} is the root of a uv-managed interpreter (it contains a {@code bin} folder on Unix or a {@code Lib} folder on
+   *     Windows)
+   */
+  private boolean isUvInterpreterRoot(Path path) {
+
+    return Files.isDirectory(path.resolve(IdeContext.FOLDER_BIN)) || Files.isDirectory(path.resolve("Lib"));
+  }
+
+  /**
+   * Reconciles the layout of a uv-managed interpreter with IDEasy's convention that a tool's executables live in a single {@code bin} folder. On Windows
+   * the interpreter puts {@code python.exe} (with the adjacent DLLs) at its root while the console scripts ({@code pip.exe}, {@code uv tool} launchers) are
+   * placed in {@code Scripts}. To expose both under one {@code bin} folder (like the previous virtualenv-based layout) this links the interpreter executables
+   * into {@code Scripts} and {@code bin} into {@code Scripts}. The executables are symbolic (not hard) links so that the process image resolves to the real
+   * path at the installation root, where the loader finds the required DLLs.
+   *
+   * @param fileAccess the {@link FileAccess} utility for file operations.
+   * @param installationPath the path where Python is installed.
+   */
+  private void createWindowsBinSymlink(FileAccess fileAccess, Path installationPath) {
+
+    if (!this.context.getSystemInfo().isWindows()) {
+      return;
+    }
+    Path scriptsPath = installationPath.resolve(FOLDER_SCRIPTS);
+    for (String exe : WINDOWS_PYTHON_EXES) {
+      Path exeSource = installationPath.resolve(exe);
+      if (Files.exists(exeSource)) {
+        fileAccess.symlink(exeSource, scriptsPath.resolve(exe));
+      }
+    }
+    fileAccess.symlink(scriptsPath, installationPath.resolve(IdeContext.FOLDER_BIN));
   }
 
   @Override
   public void setEnvironment(EnvironmentContext environmentContext, ToolInstallation toolInstallation, boolean additionalInstallation) {
 
+    // Python is a shared interpreter: each project manages its own virtual environment (see class JavaDoc), so no VIRTUAL_ENV/UV_PROJECT_ENVIRONMENT is set.
     super.setEnvironment(environmentContext, toolInstallation, additionalInstallation);
-    environmentContext.withEnvVar("VIRTUAL_ENV", toolInstallation.rootDir().toString());
-    environmentContext.withEnvVar("UV_PROJECT_ENVIRONMENT", toolInstallation.rootDir().toString());
   }
 
   @Override
@@ -103,10 +194,7 @@ public class Python extends AbstractLocalToolCommandlet {
   protected VersionIdentifier computeInstalledVersionFromLocalSoftwareFolder() {
 
     Path toolPath = getToolPath();
-    VersionIdentifier version = readVersionFromPyvenvCfg(toolPath);
-    if (version == null) {
-      version = readVersionFromInterpreter(toolPath);
-    }
+    VersionIdentifier version = readVersionFromInterpreter(toolPath);
     if (version != null) {
       LOG.debug("Determined version {} of python from the installation at {}.", version, toolPath);
     }
@@ -114,32 +202,7 @@ public class Python extends AbstractLocalToolCommandlet {
   }
 
   /**
-   * @param installationPath the {@link Path} to the virtual environment.
-   * @return the {@link VersionIdentifier} from the {@code version_info} entry of {@code pyvenv.cfg} or {@code null} if not available or not precise enough.
-   */
-  private VersionIdentifier readVersionFromPyvenvCfg(Path installationPath) {
-
-    Path pyvenvCfg = installationPath.resolve(FILE_PYVENV_CFG);
-    if (!Files.exists(pyvenvCfg)) {
-      return null;
-    }
-    String content = this.context.getFileAccess().readFileContent(pyvenvCfg);
-    for (String line : content.split("\\R")) {
-      String[] keyAndValue = line.split("=", 2);
-      if ((keyAndValue.length == 2) && keyAndValue[0].trim().equals(PYVENV_CFG_VERSION_INFO)) {
-        String value = keyAndValue[1].trim();
-        // uv only writes the minor version (e.g. "3.13") for its own interpreters what is too imprecise for us
-        if (value.chars().filter(c -> c == '.').count() >= 2) {
-          return VersionIdentifier.of(value);
-        }
-        LOG.debug("Ignoring imprecise version {} from {}.", value, pyvenvCfg);
-      }
-    }
-    return null;
-  }
-
-  /**
-   * @param installationPath the {@link Path} to the virtual environment.
+   * @param installationPath the {@link Path} to the python installation.
    * @return the {@link VersionIdentifier} reported by the installed python interpreter or {@code null} if it could not be determined.
    */
   private VersionIdentifier readVersionFromInterpreter(Path installationPath) {
@@ -172,36 +235,6 @@ public class Python extends AbstractLocalToolCommandlet {
   public ToolRepository getToolRepository() {
 
     return this.context.getPythonRepository();
-  }
-
-  /**
-   * Creates a symlink from the "Scripts" folder to the "bin" folder on Windows systems. This is necessary for compatibility with tools that expect a "bin"
-   * directory.
-   *
-   * @param fileAccess the {@link FileAccess} utility for file operations.
-   * @param installationPath the path where Python is installed.
-   */
-  private void createWindowsSymlinkBinFolder(FileAccess fileAccess, Path installationPath) {
-
-    if (!this.context.getSystemInfo().isWindows()) {
-      return;
-    }
-    Path scriptsPath = installationPath.resolve("Scripts");
-    Path binPath = installationPath.resolve("bin");
-    fileAccess.symlink(scriptsPath, binPath);
-  }
-
-  /**
-   * Renames the ".venv" folder into the installation path (Python).
-   *
-   * @param fileAccess the {@link FileAccess} utility for file operations.
-   * @param softwarePath the path where the software is installed.
-   * @param installationPath the target path where the ".venv" folder should be moved.
-   */
-  private void renameVenvFolderToPython(FileAccess fileAccess, Path softwarePath, Path installationPath) {
-
-    Path venvPath = softwarePath.resolve(VENV_FOLDER);
-    fileAccess.move(venvPath, installationPath, StandardCopyOption.REPLACE_EXISTING);
   }
 
 }
