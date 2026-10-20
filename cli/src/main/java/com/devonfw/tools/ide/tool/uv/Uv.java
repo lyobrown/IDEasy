@@ -36,16 +36,25 @@ public class Uv extends AbstractLocalToolCommandlet {
   }
 
   /**
-   * Installs a specified version of {@code Python} in the given directory using the {@code uv} environment manager.
+   * Installs the given {@code Python} version as a standalone, uv-managed interpreter into the given directory.
+   * <p>
+   * The {@code --no-bin} flag prevents uv from dropping an executable into the user's {@code ~/.local/bin}; IDEasy manages the interpreter location
+   * itself (see {@link com.devonfw.tools.ide.tool.python.Python}).
    *
-   * @param installationPath the target {@link Path} where {@code Python} should be installed
+   * @param installDir the directory uv shall install the interpreter into (uv creates a {@code cpython-*} sub-directory in it)
    * @param resolvedVersion the {@link VersionIdentifier} of the {@code Python} version to install
    * @param processContext the {@link ProcessContext} used to execute the {@code uv} command
    */
-  public void installPython(Path installationPath, VersionIdentifier resolvedVersion, ProcessContext processContext) {
+  public void installPython(Path installDir, VersionIdentifier resolvedVersion, ProcessContext processContext) {
 
-    processContext.directory(installationPath);
-    ProcessResult result = runTool(processContext, ProcessMode.DEFAULT_CAPTURE, List.of("venv", "--python", resolvedVersion.toString()));
+    List<String> args = new ArrayList<>();
+    args.add("python");
+    args.add("install");
+    args.add(resolvedVersion.toString());
+    args.add("--install-dir");
+    args.add(installDir.toString());
+    args.add("--no-bin");
+    ProcessResult result = runTool(processContext, ProcessMode.DEFAULT_CAPTURE, args);
     assert result.isSuccessful();
   }
 
