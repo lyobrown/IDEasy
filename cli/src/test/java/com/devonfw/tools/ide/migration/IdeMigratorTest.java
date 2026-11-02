@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import com.devonfw.tools.ide.context.AbstractIdeContextTest;
 import com.devonfw.tools.ide.context.IdeContext;
 import com.devonfw.tools.ide.context.IdeTestContext;
+import com.devonfw.tools.ide.version.VersionComparisonResult;
 import com.devonfw.tools.ide.version.VersionIdentifier;
 
 /**
@@ -43,6 +44,20 @@ class IdeMigratorTest extends AbstractIdeContextTest {
     // act
     migrator.run(context);
     // assert
+  }
+
+  /** Test that the latest migration (for the current release) is registered with the default migrator. */
+  @Test
+  void testLatestMigrationIsRegistered() {
+
+    // arrange
+    IdeMigrator migrator = new IdeMigrator();
+
+    // act
+    VersionIdentifier targetVersion = migrator.getTargetVersion();
+
+    // assert - the registered migrations must include the one of the current release (or a newer one)
+    assertThat(targetVersion.compareVersion(VersionIdentifier.of("2026.11.001"))).isNotEqualTo(VersionComparisonResult.LESS);
   }
 
   /** Test that required migrations are properly applied and older migrations are not. */
