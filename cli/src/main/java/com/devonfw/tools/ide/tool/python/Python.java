@@ -114,16 +114,20 @@ public class Python extends AbstractLocalToolCommandlet {
   }
 
   /**
-   * Determines the interpreter directory that uv created in the given staging folder. On Windows the interpreter lives in a {@code python} sub-folder, on all
-   * other platforms in a {@code bin} sub-folder.
+   * Determines the interpreter directory that uv created in the given staging folder. uv places the interpreter in a directory named after the full version
+   * (e.g. {@code cpython-3.14.10-...}) and additionally drops a short version alias next to it (e.g. {@code cpython-3.14-...}). That alias is a symbolic link
+   * (or on Windows a directory junction) and is ignored, so the actual interpreter is the unique remaining directory.
    *
    * @param stagingPath the folder uv installed the interpreter into
    * @return the directory to be relocated into the python installation
    */
-  private Path findUvInterpreterDir(Path stagingPath) {
+  Path findUvInterpreterDir(Path stagingPath) {
 
+    // On Windows the short version alias is a directory junction (reparse point) that Files.isSymbolicLink does not detect, so junctions must be excluded
+    // explicitly, otherwise both the alias and the actual interpreter would be reported.
+    FileAccess fileAccess = this.context.getFileAccess();
     try (Stream<Path> children = Files.list(stagingPath)) {
-      List<Path> candidates = children.filter(child -> !Files.isSymbolicLink(child)).filter(Files::isDirectory)
+      List<Path> candidates = children.filter(child -> !Files.isSymbolicLink(child) && !fileAccess.isJunction(child)).filter(Files::isDirectory)
           .filter(child -> !child.getFileName().toString().startsWith(".")).filter(this::isUvInterpreterRoot).toList();
       if (candidates.size() != 1) {
         throw new CliException("Unexpected interpreter layout in uv staging folder " + stagingPath

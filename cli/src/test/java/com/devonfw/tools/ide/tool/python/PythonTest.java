@@ -14,6 +14,7 @@ import com.devonfw.tools.ide.context.IdeTestContext;
 import com.devonfw.tools.ide.environment.EnvironmentVariablesType;
 import com.devonfw.tools.ide.environment.VariableLine;
 import com.devonfw.tools.ide.environment.VariableSource;
+import com.devonfw.tools.ide.io.WindowsSymlinkTestHelper;
 import com.devonfw.tools.ide.os.SystemInfoMock;
 import com.devonfw.tools.ide.os.WindowsPathSyntax;
 import com.devonfw.tools.ide.process.EnvironmentVariableCollectorContext;
@@ -132,5 +133,30 @@ public class PythonTest extends AbstractIdeContextTest {
     assertThat(variables).doesNotContainKey("VIRTUAL_ENV");
     assertThat(variables).doesNotContainKey("UV_PROJECT_ENVIRONMENT");
     assertThat(variables).containsKey("PYTHON_HOME");
+  }
+
+  /**
+   * Test that {@link Python#findUvInterpreterDir(Path)} ignores the short version alias that uv drops next to the interpreter directory (e.g. {@code
+   * cpython-3.14-...} pointing to {@code cpython-3.14.10-...}) and returns the actual interpreter. On Windows that alias is a directory junction (a reparse
+   * point that {@link Files#isSymbolicLink} does not detect, see <a href="https://github.com/devonfw/IDEasy/issues/2701">issue 2701</a>); here it is modeled
+   * as a symbolic link, the portable equivalent of the "link that must be ignored" case.
+   */
+  @Test
+  public void testFindUvInterpreterDirIgnoresUvVersionAlias() throws IOException {
+
+    WindowsSymlinkTestHelper.assumeSymlinksSupported();
+
+    // arrange
+    Path staging = Files.createTempDirectory("uv-staging-test");
+    Path interpreter = staging.resolve("cpython-3.14.10");
+    Files.createDirectory(interpreter);
+    Files.createDirectory(interpreter.resolve("Lib"));
+    Files.createSymbolicLink(staging.resolve("cpython-3.14"), interpreter);
+
+    // act
+    Path result = new Python(newContext(PROJECT_BASIC)).findUvInterpreterDir(staging);
+
+    // assert
+    assertThat(result).isEqualTo(interpreter);
   }
 }
